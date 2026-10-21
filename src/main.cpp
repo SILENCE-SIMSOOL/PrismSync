@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <memory>
 #include <array>
+#include <regex>
 #pragma comment(lib,"gdiplus.lib")
 #pragma comment(lib,"shlwapi.lib")
 #pragma comment(lib,"wininet.lib")
@@ -56,7 +57,8 @@ static std::atomic<bool> cancelWork{false};
 static bool busy=false, closing=false;
 static std::mutex workMutex;
 static constexpr UINT WORK_PROGRESS=WM_APP+1, WORK_DONE=WM_APP+2;
-enum class WorkKind { Preview, Apply, CheckUpdate, Download };
+enum class ReportTone { Info, Success, Warning, Error };
+enum class WorkKind { Preview, Apply, CheckUpdate, Download, UpdateMods };
 struct WorkEvent {
 	WorkKind kind;
 	syncer::Plan plan;
@@ -64,6 +66,8 @@ struct WorkEvent {
 	updater::Release release;
 	fs::path path;
 	std::string error;
+	std::wstring modTitle, modSummary, modDetails;
+	ReportTone modTone = ReportTone::Info;
 };
 static std::unique_ptr<WorkEvent> completedWork;
 static std::wstring workProgress;
@@ -129,6 +133,15 @@ static std::wstring utf8ToWide(const std::string& bytes) {
 	if(n<=0) return {};
 	std::wstring result(n,L'\0');
 	MultiByteToWideChar(CP_UTF8,0,bytes.data(),(int)bytes.size(),result.data(),n);
+	return result;
+}
+
+static std::string wideToUtf8(const std::wstring& wide) {
+	if(wide.empty()) return {};
+	int n=WideCharToMultiByte(CP_UTF8,0,wide.data(),(int)wide.size(),nullptr,0,nullptr,nullptr);
+	if(n<=0) return {};
+	std::string result(n,'\0');
+	WideCharToMultiByte(CP_UTF8,0,wide.data(),(int)wide.size(),result.data(),n,nullptr,nullptr);
 	return result;
 }
 
@@ -625,22 +638,56 @@ static Rect scrollbar(Graphics& g,const Rect& track,int offset,int maximum,bool 
 
 static void drawContext(Graphics& g,int width,int height) {
 	if(contextId.empty()) return;
-	const auto open=tr(L"Open folder",L"폴더 열기",L"打开文件夹",L"フォルダーを開く");
-	const auto makeMain=tr(L"Set as main instance",L"메인 인스턴스로 지정",L"设为主实例",L"メインに設定");
-	int menuWidth=(int)std::max(labelWidth(g,open,13,FontWeight::Medium),labelWidth(g,makeMain,13,FontWeight::Medium))+48;
-	contextRect.Width=menuWidth; contextRect.Height=82;
-	contextRect.X=std::clamp(contextRect.X,8,std::max(8,width-menuWidth-8));
-	contextRect.Y=std::clamp(contextRect.Y,58,std::max(58,height-90));
-	// Native edit controls paint above the parent canvas; keep the menu clear of the search field.
-	if(contextRect.IntersectsWith(Rect(width-322,255,202,18))) contextRect.Y=std::max(58,contextRect.Y-82);
-	panel(g,(float)contextRect.X+2,(float)contextRect.Y+3,(float)menuWidth,82,rgb(0,0,0,22),Color(0,0,0,0),10);
-	panel(g,(float)contextRect.X,(float)contextRect.Y,(float)menuWidth,82,rgb(255,255,255),rgb(226,232,240),10);
-	for(int i=0;i<2;i++) {
-		int y=contextRect.Y+5+i*36, kind=15+i;
-		if(hoveredKind==kind) panel(g,(float)contextRect.X+5,(float)y,(float)menuWidth-10,36,rgb(239,246,255),Color(0,0,0,0),6);
-		glyph(g,i?0xF521:0xF07B,contextRect.X+13,y+11,14,rgb(71,85,105));
-		label(g,i?makeMain:open,(float)contextRect.X+36,(float)y,(float)menuWidth-44,36,13,rgb(30,41,59),FontWeight::Medium);
-		hit(contextRect.X+5,y,menuWidth-10,36,kind);
+	struct ContextItem {
+		int kind;
+		wchar_t glyphChar;
+		std::wstring text;
+		bool separatorAfter;
+	};
+	std::vector<ContextItem> items = {
+		{ 15, 0xF07B, tr(L"Open folder", L"폴더 열기", L"打开文件夹", L"フォルダーを開く"), false },
+		{ 16, 0xF521, tr(L"Set as main instance", L"메인 인스턴스로 지정", L"设为主实例", L"メインに設定"), true },
+		{ 17, 0xF0C7, tr(L"Save as custom MC options", L"내 커스텀 MC 옵션으로 저장", L"保存为自定义 MC 选项", L"カスタムMCオプションとして保存"), false },
+		{ 18, 0xF0C5, tr(L"Overwrite with custom MC options", L"내 커스텀 MC 옵션으로 덮어씌우기", L"应用自定义 MC 选项覆盖", L"カスタムMCオプションで上書き"), false },
+		{ 19, 0xF1B2, tr(L"Save as custom Fabric settings", L"내 커스텀 패브릭 설정으로 저장", L"保存为自定义 Fabric 设置", L"カスタムFabric設定として保存"), false },
+		{ 20, 0xF0C5, tr(L"Overwrite with custom Fabric settings", L"내 커스텀 패브릭 설정으로 덮어씌우기", L"应用自定义 Fabric 设置覆盖", L"カスタムFabric設定で上書き"), true },
+		{ 21, 0xF019, tr(L"Download / Update mods (SilenceUtils & LucentClient)", L"SilenceUtils & LucentClient 다운로드/업데이트", L"下载/更新模组 (SilenceUtils & LucentClient)", L"MODダウンロード/更新 (SilenceUtils & LucentClient)"), false }
+	};
+
+	float maxTextW = 0.f;
+	int separators = 0;
+	for(const auto& item : items) {
+		maxTextW = (std::max)(maxTextW, labelWidth(g, item.text, 13, FontWeight::Medium));
+		if(item.separatorAfter) separators++;
+	}
+
+	int menuWidth = (int)maxTextW + 52;
+	int menuHeight = 10 + (int)items.size() * 34 + separators * 7;
+	contextRect.Width = menuWidth;
+	contextRect.Height = menuHeight;
+	contextRect.X = std::clamp(contextRect.X, 8, std::max(8, width - menuWidth - 8));
+	contextRect.Y = std::clamp(contextRect.Y, 58, std::max(58, height - menuHeight - 10));
+	if(contextRect.IntersectsWith(Rect(width - 322, 255, 202, 18))) {
+		contextRect.Y = std::max(58, contextRect.Y - menuHeight);
+	}
+
+	panel(g, (float)contextRect.X + 2, (float)contextRect.Y + 3, (float)menuWidth, (float)menuHeight, rgb(0, 0, 0, 22), Color(0, 0, 0, 0), 10);
+	panel(g, (float)contextRect.X, (float)contextRect.Y, (float)menuWidth, (float)menuHeight, rgb(255, 255, 255), rgb(226, 232, 240), 10);
+
+	int curY = contextRect.Y + 5;
+	for(const auto& item : items) {
+		if(hoveredKind == item.kind) {
+			panel(g, (float)contextRect.X + 5, (float)curY, (float)menuWidth - 10, 34, rgb(239, 246, 255), Color(0, 0, 0, 0), 6);
+		}
+		glyph(g, item.glyphChar, contextRect.X + 13, curY + 10, 14, rgb(71, 85, 105));
+		label(g, item.text, (float)contextRect.X + 36, (float)curY, (float)menuWidth - 44, 34, 13, rgb(30, 41, 59), FontWeight::Medium);
+		hit(contextRect.X + 5, curY, menuWidth - 10, 34, item.kind);
+		curY += 34;
+		if(item.separatorAfter) {
+			SolidBrush sepBrush(rgb(226, 232, 240));
+			g.FillRectangle(&sepBrush, contextRect.X + 10, curY + 3, menuWidth - 20, 1);
+			curY += 7;
+		}
 	}
 }
 
@@ -1025,7 +1072,7 @@ static fs::path gameDir(const Instance& i) {
 	return fs::is_directory(root/L"minecraft")?root/L"minecraft":root/L".minecraft";
 }
 
-enum class ReportTone { Info, Success, Warning, Error };
+
 struct ReportState {
 	std::wstring title,text,summary;
 	ReportTone tone=ReportTone::Info;
@@ -1250,6 +1297,8 @@ static void finishWork() {
 				PostMessageW(windowHandle,WM_CLOSE,0,0);
 			} catch(const std::exception& e) { report(tr(L"Operation failed",L"작업 실패"),utf8ToWide(e.what()),false,ReportTone::Error); }
 		}
+	} else if(event->kind==WorkKind::UpdateMods) {
+		report(event->modTitle, event->modDetails, false, event->modTone, event->modSummary);
 	}
 	redraw(windowHandle);
 }
@@ -1282,6 +1331,315 @@ static void openInstanceFolder(const Instance& instance) {
 		if((INT_PTR)ShellExecuteW(windowHandle,L"open",path.c_str(),nullptr,nullptr,SW_SHOWNORMAL)<=32)
 			throw std::runtime_error("Unable to open instance folder");
 	} catch(const std::exception& e) { report(tr(L"Unable to open folder",L"폴더를 열 수 없어"),utf8ToWide(e.what()),false,ReportTone::Error); }
+}
+static const wchar_t* FABRIC_CONFIG_FILES[] = {
+	L"sodium-options.json",
+	L"sodium-mixins.properties",
+	L"sodium-fingerprint.json",
+	L"sodium-extra-options.json",
+	L"sodium-extra.properties"
+};
+
+static void saveCustomMcOptions(const Instance& instance) {
+	try {
+		auto src = gameDir(instance) / L"options.txt";
+		if(!fs::exists(src)) {
+			report(tr(L"Save failed", L"저장 실패"), tr(L"options.txt was not found in this instance.", L"해당 인스턴스에 options.txt 파일이 없어."), false, ReportTone::Error);
+			return;
+		}
+		auto dstDir = settingsDir / L"custom_mc";
+		fs::create_directories(dstDir);
+		fs::copy_file(src, dstDir / L"options.txt", fs::copy_options::overwrite_existing);
+		report(tr(L"Options saved", L"저장 완료"), tr(L"Custom MC options (options.txt) saved successfully.", L"내 커스텀 MC 옵션(options.txt)으로 저장했어."), false, ReportTone::Success);
+	} catch(const std::exception& e) {
+		report(tr(L"Save failed", L"저장 실패"), utf8ToWide(e.what()), false, ReportTone::Error);
+	}
+}
+
+static void applyCustomMcOptions(const Instance& instance) {
+	try {
+		auto src = settingsDir / L"custom_mc" / L"options.txt";
+		if(!fs::exists(src)) {
+			report(tr(L"Apply failed", L"덮어씌우기 실패"), tr(L"No saved custom MC options found. Please save from an instance first.", L"저장된 커스텀 MC 옵션이 없어. 먼저 원하는 인스턴스에서 저장해 줘."), false, ReportTone::Error);
+			return;
+		}
+		std::wstring msg = tr(L"Overwrite options.txt of '", L"'") + instance.name + tr(L"' with custom MC options?\nMake sure Minecraft is closed.", L"' 인스턴스의 options.txt를 내 커스텀 MC 옵션으로 덮어씌울까?\n마인크래프트가 실행 중이라면 종료하고 진행해.");
+		if(!report(tr(L"Confirm overwrite", L"덮어씌우기 확인"), msg, true, ReportTone::Warning)) return;
+		auto dst = gameDir(instance) / L"options.txt";
+		fs::create_directories(dst.parent_path());
+		fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+		report(tr(L"Options applied", L"덮어씌우기 완료"), tr(L"Custom MC options applied to '", L"'") + instance.name + tr(L"' successfully.", L"' 인스턴스에 성공적으로 덮어씌웠어."), false, ReportTone::Success);
+	} catch(const std::exception& e) {
+		report(tr(L"Apply failed", L"덮어씌우기 실패"), utf8ToWide(e.what()), false, ReportTone::Error);
+	}
+}
+
+static void saveCustomFabricConfig(const Instance& instance) {
+	try {
+		auto srcDir = gameDir(instance) / L"config";
+		auto dstDir = settingsDir / L"custom_fabric";
+		fs::create_directories(dstDir);
+		int savedCount = 0;
+		std::wstring fileList;
+		for(auto name : FABRIC_CONFIG_FILES) {
+			auto src = srcDir / name;
+			if(fs::exists(src)) {
+				fs::copy_file(src, dstDir / name, fs::copy_options::overwrite_existing);
+				savedCount++;
+				fileList += L"  - " + std::wstring(name) + L"\n";
+			}
+		}
+		if(savedCount == 0) {
+			report(tr(L"Save failed", L"저장 실패"), tr(L"No sodium fabric config files found in this instance.", L"해당 인스턴스 config 폴더에 sodium 관련 설정 파일이 없어."), false, ReportTone::Warning);
+			return;
+		}
+		std::wstring msg = tr(L"Saved ", L"총 ") + std::to_wstring(savedCount) + tr(L" Fabric config file(s):\n\n", L"개의 패브릭 설정 파일을 저장했어:\n\n") + fileList;
+		report(tr(L"Fabric settings saved", L"저장 완료"), msg, false, ReportTone::Success);
+	} catch(const std::exception& e) {
+		report(tr(L"Save failed", L"저장 실패"), utf8ToWide(e.what()), false, ReportTone::Error);
+	}
+}
+
+static void applyCustomFabricConfig(const Instance& instance) {
+	try {
+		auto srcDir = settingsDir / L"custom_fabric";
+		std::vector<const wchar_t*> available;
+		for(auto name : FABRIC_CONFIG_FILES) {
+			if(fs::exists(srcDir / name)) available.push_back(name);
+		}
+		if(available.empty()) {
+			report(tr(L"Apply failed", L"덮어씌우기 실패"), tr(L"No saved custom Fabric settings found. Please save from an instance first.", L"저장된 커스텀 패브릭 설정이 없어. 먼저 원하는 인스턴스에서 저장해 줘."), false, ReportTone::Error);
+			return;
+		}
+		std::wstring fileList;
+		for(auto name : available) fileList += L"  - " + std::wstring(name) + L"\n";
+		std::wstring msg = tr(L"Overwrite Fabric config of '", L"'") + instance.name + tr(L"' with custom settings?\n\nFiles to apply:\n", L"' 인스턴스의 패브릭 설정을 저장된 커스텀 설정으로 덮어씌울까?\n\n적용할 파일 목록:\n") + fileList + tr(L"\nMake sure Minecraft is closed.", L"\n마인크래프트가 실행 중이라면 종료하고 진행해.");
+		if(!report(tr(L"Confirm overwrite", L"덮어씌우기 확인"), msg, true, ReportTone::Warning)) return;
+		auto dstDir = gameDir(instance) / L"config";
+		fs::create_directories(dstDir);
+		for(auto name : available) {
+			fs::copy_file(srcDir / name, dstDir / name, fs::copy_options::overwrite_existing);
+		}
+		report(tr(L"Fabric settings applied", L"덮어씌우기 완료"), tr(L"Successfully applied custom Fabric settings to '", L"'") + instance.name + tr(L"'.", L"' 인스턴스에 커스텀 패브릭 설정을 덮어씌웠어."), false, ReportTone::Success);
+	} catch(const std::exception& e) {
+		report(tr(L"Apply failed", L"덮어씌우기 실패"), utf8ToWide(e.what()), false, ReportTone::Error);
+	}
+}
+
+static std::string cleanMcVer(std::string ver) {
+	std::string out;
+	for(char c : ver) out += (char)tolower((unsigned char)c);
+	auto pos = out.find("minecraft");
+	if(pos != std::string::npos) out.erase(pos, 9);
+	pos = out.find("mc");
+	if(pos != std::string::npos) out.erase(pos, 2);
+	while(!out.empty() && (out.front()==' ' || out.front()=='\t' || out.front()=='-' || out.front()=='_')) out.erase(out.begin());
+	while(!out.empty() && (out.back()==' ' || out.back()=='\t' || out.back()=='-' || out.back()=='_')) out.pop_back();
+	return out;
+}
+
+static bool isMcVersionMatching(const std::string& assetMc, const std::string& currentMc) {
+	std::string ca = cleanMcVer(assetMc);
+	std::string cc = cleanMcVer(currentMc);
+	if(ca.empty() || cc.empty()) return false;
+	return ca == cc || ca.starts_with(cc) || cc.starts_with(ca);
+}
+
+static bool isVersionNewer(const std::string& candidate, const std::string& current) {
+	auto split = [](const std::string& s) {
+		std::vector<int> parts;
+		size_t start = 0;
+		while(start < s.size()) {
+			auto dot = s.find('.', start);
+			std::string token = s.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+			std::string num;
+			for(char c : token) if(c >= '0' && c <= '9') num += c;
+			parts.push_back(num.empty() ? 0 : std::stoi(num));
+			if(dot == std::string::npos) break;
+			start = dot + 1;
+		}
+		return parts;
+	};
+	try {
+		auto cParts = split(candidate);
+		auto curParts = split(current);
+		size_t len = (std::max)(cParts.size(), curParts.size());
+		for(size_t i = 0; i < len; i++) {
+			int cVal = i < cParts.size() ? cParts[i] : 0;
+			int curVal = i < curParts.size() ? curParts[i] : 0;
+			if(cVal > curVal) return true;
+			if(cVal < curVal) return false;
+		}
+	} catch(...) {
+		return false;
+	}
+	return false;
+}
+
+static void checkAndDownloadMods(const Instance& in) {
+	if(busy) return;
+	Instance target = in;
+	startWork(WorkKind::UpdateMods, [target](WorkEvent& event) {
+		auto game = gameDir(target);
+		std::string mcVer = cleanMcVer(wideToUtf8(target.version));
+		if(mcVer.empty() || mcVer == "minecraft" || mcVer.find("metadata") != std::string::npos) {
+			mcVer = cleanMcVer(wideToUtf8(target.id));
+		}
+		if(mcVer.empty()) throw std::runtime_error("Instance Minecraft version could not be determined");
+
+		auto modsDir = game / L"mods";
+		fs::create_directories(modsDir);
+
+		struct ModSpec {
+			std::string name;
+			std::string repo;
+			std::vector<std::string> prefixes;
+		};
+		std::vector<ModSpec> specs = {
+			{ "SilenceUtils", "SILENCE-SIMSOOL/SilenceUtils", { "silenceutils" } },
+			{ "LucentClient", "SILENCE-SIMSOOL/Lucent-Client", { "lucentclient", "lucent-client" } }
+		};
+
+		static const std::regex FILENAME_PATTERN(
+			R"(^([A-Za-z0-9_.-]+)-([0-9]+(?:\.[0-9]+)+)-mc([A-Za-z0-9_.-]+)\.jar$)",
+			std::regex_constants::icase
+		);
+
+		std::vector<std::wstring> results;
+		bool anyUpdated = false;
+
+		for(const auto& spec : specs) {
+			syncer::check(cancelWork);
+
+			// 1. Scan existing jars in modsDir
+			std::string installedVer;
+			std::vector<fs::path> oldFiles;
+			std::error_code ec;
+			for(auto& entry : fs::directory_iterator(modsDir, ec)) {
+				if(!entry.is_regular_file(ec)) continue;
+				auto fname = wideToUtf8(entry.path().filename().wstring());
+				std::string lowerName;
+				for(char c : fname) lowerName += (char)tolower((unsigned char)c);
+				if(!lowerName.ends_with(".jar")) continue;
+
+				bool matchPrefix = false;
+				for(const auto& p : spec.prefixes) {
+					if(lowerName.starts_with(p)) { matchPrefix = true; break; }
+				}
+				if(!matchPrefix) continue;
+
+				std::smatch m;
+				if(std::regex_match(fname, m, FILENAME_PATTERN)) {
+					std::string fileModVer = m[2].str();
+					std::string fileMcVer = m[3].str();
+					if(isMcVersionMatching(fileMcVer, mcVer)) {
+						oldFiles.push_back(entry.path());
+						if(installedVer.empty() || isVersionNewer(fileModVer, installedVer)) {
+							installedVer = fileModVer;
+						}
+					}
+				}
+			}
+
+			// 2. Fetch releases from GitHub API
+			publishProgress(utf8ToWide(spec.name) + L": " + tr(L"Checking updates...", L"업데이트 확인 중..."), 0, 0, 0, 0);
+			std::ostringstream body;
+			std::wstring apiUrl = L"https://api.github.com/repos/" + utf8ToWide(spec.repo) + L"/releases";
+			updater::fetch(apiUrl, body, 10 * 1024 * 1024, cancelWork);
+			auto releasesJson = syncer::Json::parse(body.str());
+
+			// 3. Find best asset
+			struct BestAsset {
+				std::string name;
+				std::string version;
+				std::string downloadUrl;
+				uint64_t size = 0;
+			};
+			BestAsset best;
+			if(releasesJson.is_array()) {
+				for(const auto& rel : releasesJson) {
+					if(rel.value("draft", false)) continue;
+					auto assetsIt = rel.find("assets");
+					if(assetsIt == rel.end() || !assetsIt->is_array()) continue;
+					for(const auto& asset : *assetsIt) {
+						std::string assetName = asset.value("name", "");
+						std::string lowerAsset;
+						for(char c : assetName) lowerAsset += (char)tolower((unsigned char)c);
+						if(lowerAsset.find("-library") != std::string::npos || lowerAsset.find("-lite") != std::string::npos) continue;
+
+						std::smatch m;
+						if(std::regex_match(assetName, m, FILENAME_PATTERN)) {
+							std::string modName = m[1].str();
+							std::string modVer = m[2].str();
+							std::string assetMc = m[3].str();
+							bool modNameMatches = (_stricmp(modName.c_str(), spec.name.c_str()) == 0);
+							if(spec.name == "LucentClient" && _stricmp(modName.c_str(), "Lucent-Client") == 0) modNameMatches = true;
+
+							if(modNameMatches && isMcVersionMatching(assetMc, mcVer)) {
+								if(best.name.empty() || isVersionNewer(modVer, best.version)) {
+									best.name = assetName;
+									best.version = modVer;
+									best.downloadUrl = asset.value("browser_download_url", "");
+									best.size = asset.value("size", (uint64_t)0);
+								}
+							}
+						}
+					}
+				}
+			}
+
+			if(best.name.empty()) {
+				results.push_back(utf8ToWide(spec.name) + L": " + tr(L"No release found for MC ", L"MC ") + utf8ToWide(mcVer) + tr(L"", L" 버전에 맞는 릴리즈가 없어."));
+				continue;
+			}
+
+			if(!installedVer.empty() && !isVersionNewer(best.version, installedVer)) {
+				results.push_back(utf8ToWide(spec.name) + L": " + tr(L"Already up to date (v", L"이미 최신 버전이야 (v") + utf8ToWide(installedVer) + L")");
+				continue;
+			}
+
+			// 4. Download and update
+			bool isUpdate = !installedVer.empty();
+			auto targetJar = modsDir / utf8ToWide(best.name);
+			auto tempJar = modsDir / utf8ToWide(best.name + ".part");
+
+			publishProgress(utf8ToWide(best.name), 0, best.size, 0, 1);
+			std::ofstream out(tempJar, std::ios::binary | std::ios::trunc);
+			if(!out) throw std::runtime_error("Cannot create temp file: " + wideToUtf8(tempJar.wstring()));
+			updater::fetch(utf8ToWide(best.downloadUrl), out, 500ull * 1024 * 1024, cancelWork, [&](uint64_t bytes) {
+				publishProgress(utf8ToWide(best.name), bytes, best.size, 0, 1);
+			});
+			out.close();
+
+			syncer::flush(tempJar);
+			MoveFileExW(tempJar.c_str(), targetJar.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+
+			int cleaned = 0;
+			for(const auto& oldPath : oldFiles) {
+				if(_wcsicmp(oldPath.wstring().c_str(), targetJar.wstring().c_str()) != 0) {
+					std::error_code ecRemove;
+					fs::remove(oldPath, ecRemove);
+					cleaned++;
+				}
+			}
+
+			if(isUpdate) {
+				results.push_back(utf8ToWide(spec.name) + L": v" + utf8ToWide(installedVer) + L" -> v" + utf8ToWide(best.version) + tr(L" updated", L" 업데이트 완료") + (cleaned > 0 ? tr(L" (old jar deleted)", L" (구버전 파일 삭제됨)") : L""));
+			} else {
+				results.push_back(utf8ToWide(spec.name) + L": v" + utf8ToWide(best.version) + tr(L" downloaded & installed", L" 다운로드 및 설치 완료"));
+			}
+			anyUpdated = true;
+		}
+
+		event.modTitle = tr(L"Mod Download & Update", L"모드 다운로드 및 업데이트");
+		event.modSummary = tr(L"Instance: ", L"인스턴스: ") + target.name + tr(L" · MC Version: ", L" · MC 버전: ") + utf8ToWide(mcVer);
+		event.modTone = anyUpdated ? ReportTone::Success : ReportTone::Info;
+		std::wstring details;
+		for(const auto& r : results) {
+			details += L"• " + r + L"\n\n";
+		}
+		event.modDetails = details;
+	});
 }
 static void setOptionsScroll(int value,int height) {
 	optionsScroll=std::clamp(value,0,std::max(0,546-height)); langDropdownOpen=false; redraw(windowHandle);
@@ -1336,6 +1694,11 @@ static void interact(int x,int y,int width) {
 		} break;
 		case 15: { auto instance=lookup(contextId); contextId.clear(); if(instance) openInstanceFolder(*instance); } break;
 		case 16: { auto id=contextId; contextId.clear(); setMainInstance(id); } break;
+		case 17: { auto instance=lookup(contextId); contextId.clear(); if(instance) saveCustomMcOptions(*instance); } break;
+		case 18: { auto instance=lookup(contextId); contextId.clear(); if(instance) applyCustomMcOptions(*instance); } break;
+		case 19: { auto instance=lookup(contextId); contextId.clear(); if(instance) saveCustomFabricConfig(*instance); } break;
+		case 20: { auto instance=lookup(contextId); contextId.clear(); if(instance) applyCustomFabricConfig(*instance); } break;
+		case 21: { auto instance=lookup(contextId); contextId.clear(); if(instance) checkAndDownloadMods(*instance); } break;
 		case 8: checkUpdates(); break;
 		case 9: if(!choosingMain && lookup(selectedId)) applyTo(*lookup(selectedId)); break;
 		case 10: setScroll(scrollX+index*(cardWidth+cardGap)*2,width); break;
